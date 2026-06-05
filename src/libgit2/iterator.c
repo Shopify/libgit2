@@ -128,13 +128,15 @@ static int iterator_init_common(
 		ignore_case = true;
 	} else if ((iter->flags & GIT_ITERATOR_DONT_IGNORE_CASE) != 0) {
 		ignore_case = false;
+	} else if (index) {
+		ignore_case = !!index->ignore_case;
 	} else if (repo) {
-		git_index *index;
+		git_index *repo_index;
 
-		if ((error = git_repository_index__weakptr(&index, iter->repo)) < 0)
+		if ((error = git_repository_index__weakptr(&repo_index, iter->repo)) < 0)
 			return error;
 
-		ignore_case = !!index->ignore_case;
+		ignore_case = !!repo_index->ignore_case;
 
 		if (ignore_case == 1)
 			iter->flags |= GIT_ITERATOR_IGNORE_CASE;

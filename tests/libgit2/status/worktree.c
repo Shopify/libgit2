@@ -1,6 +1,9 @@
 #include "clar_libgit2.h"
 #include "futils.h"
+#include "hash.h"
 #include "ignore.h"
+#include "index.h"
+#include "repository.h"
 #include "status_data.h"
 #include "posix.h"
 #include "util.h"
@@ -8,6 +11,111 @@
 #include "../diff/diff_helpers.h"
 #include "../checkout/checkout_helpers.h"
 #include "git2/sys/diff.h"
+
+static void write_u32(git_str *out, uint32_t value)
+{
+	uint32_t ondisk = htonl(value);
+	cl_git_pass(git_str_put(out, (char *)&ondisk, sizeof(ondisk)));
+}
+
+static void write_u16(git_str *out, uint16_t value)
+{
+	uint16_t ondisk = htons(value);
+	cl_git_pass(git_str_put(out, (char *)&ondisk, sizeof(ondisk)));
+}
+
+static void write_sparse_index_entry(
+	git_str *out,
+	const char *path,
+	const git_oid *id,
+	uint32_t mode,
+	uint16_t flags_extended,
+	uint32_t file_size)
+{
+	size_t path_len = strlen(path), entry_size, padding;
+
+	write_u32(out, 0); /* ctime seconds */
+	write_u32(out, 0); /* ctime nanoseconds */
+	write_u32(out, 0); /* mtime seconds */
+	write_u32(out, 0); /* mtime nanoseconds */
+	write_u32(out, 0); /* dev */
+	write_u32(out, 0); /* ino */
+	write_u32(out, mode);
+	write_u32(out, 0); /* uid */
+	write_u32(out, 0); /* gid */
+	write_u32(out, file_size);
+	cl_git_pass(git_str_put(out, (char *)&id->id, GIT_OID_SHA1_SIZE));
+	write_u16(out, (uint16_t)min(path_len, (size_t)GIT_INDEX_ENTRY_NAMEMASK) |
+		(flags_extended ? GIT_INDEX_ENTRY_EXTENDED : 0));
+	if (flags_extended)
+		write_u16(out, flags_extended);
+	cl_git_pass(git_str_put(out, path, path_len + 1));
+
+	entry_size = 40 + GIT_OID_SHA1_SIZE + 2 +
+		(flags_extended ? 2 : 0) + path_len + 1;
+	padding = (8 - (entry_size % 8)) % 8;
+	cl_git_pass(git_str_put(out, "\0\0\0\0\0\0\0\0", padding));
+}
+
+static void write_sparse_status_index(
+	const char *index_path,
+	const git_oid *tracked_file_id,
+	const git_oid *sparse_tree_id)
+{
+	git_str out = GIT_STR_INIT;
+	unsigned char checksum[GIT_HASH_SHA1_SIZE];
+
+	write_u32(&out, 0x44495243); /* DIRC */
+	write_u32(&out, 3);
+	write_u32(&out, 2);
+	write_sparse_index_entry(&out, "checked-out.txt", tracked_file_id,
+		GIT_FILEMODE_BLOB, 0, 6);
+	write_sparse_index_entry(&out, "sparse/", sparse_tree_id,
+		GIT_FILEMODE_TREE, GIT_INDEX_ENTRY_SKIP_WORKTREE, 0);
+	cl_git_pass(git_str_put(&out, "sdir", 4));
+	write_u32(&out, 0);
+	cl_git_pass(git_hash_buf(
+		checksum, out.ptr, out.size, GIT_HASH_ALGORITHM_SHA1));
+	cl_git_pass(git_str_put(&out, (char *)checksum, sizeof(checksum)));
+
+	cl_git_pass(git_futils_writebuffer(&out, index_path,
+		O_RDWR | O_CREAT | O_TRUNC, GIT_INDEX_FILE_MODE));
+	git_str_dispose(&out);
+}
+
+static void write_sparse_status_fixture(
+	git_repository **out_repo,
+	const char **out_index_path)
+{
+	git_repository *repo;
+	git_oid tracked_file_id, sparse_tree_id;
+
+	cl_git_pass(git_repository_init(&repo, "./sparse-status", 0));
+	/* Workdir-only status should not need to inspect HEAD. */
+	cl_git_mkfile("sparse-status/.git/HEAD", "ref: refs/heads/sparse-status\n");
+	cl_git_mkfile("sparse-status/.git/refs/heads/sparse-status",
+		"not-a-valid-oid\n");
+	cl_git_pass(git_blob_create_from_buffer(&tracked_file_id, repo, "clean\n", 6));
+	cl_git_mkfile("sparse-status/checked-out.txt", "clean\n");
+
+	/* Deliberately absent object: sparse status must not need to read it. */
+	cl_git_pass(git_oid_from_string(&sparse_tree_id,
+		"1111111111111111111111111111111111111111", GIT_OID_SHA1));
+
+	*out_index_path = "sparse-status/.git/index";
+	write_sparse_status_index(*out_index_path, &tracked_file_id, &sparse_tree_id);
+
+	*out_repo = repo;
+}
+
+static void assert_sparse_status_index_is_preserved(const char *index_path)
+{
+	git_str rewritten = GIT_STR_INIT;
+
+	cl_git_pass(git_futils_readbuffer(&rewritten, index_path));
+	cl_assert(git__memmem(rewritten.ptr, rewritten.size, "sdir", 4) != NULL);
+	git_str_dispose(&rewritten);
+}
 
 /**
  * Cleanup
@@ -1369,4 +1477,112 @@ void test_status_worktree__skip_hash(void)
 	cl_git_pass(git_repository_index(&index, repo));
 	cl_git_pass(git_index_read(index, true));
 	git_index_free(index);
+}
+
+void test_status_worktree__sparse_index_workdir_only_preserves_sparse_dirs(void)
+{
+	git_repository *repo;
+	git_status_options opts = GIT_STATUS_OPTIONS_INIT;
+	git_status_list *statuslist;
+	git_index *index;
+	const char *index_path;
+
+	write_sparse_status_fixture(&repo, &index_path);
+
+	opts.show = GIT_STATUS_SHOW_WORKDIR_ONLY;
+	opts.flags = GIT_STATUS_OPT_INCLUDE_UNMODIFIED;
+
+	cl_git_pass(git_status_list_new(&statuslist, repo, &opts));
+	cl_assert_equal_sz(1, git_status_list_entrycount(statuslist));
+	cl_assert_equal_i(GIT_STATUS_CURRENT, git_status_byindex(statuslist, 0)->status);
+	cl_assert_equal_s("checked-out.txt",
+		git_status_byindex(statuslist, 0)->index_to_workdir->old_file.path);
+	git_status_list_free(statuslist);
+
+	cl_git_pass(git_repository_index__open_sparsely(&index, repo));
+	cl_assert(index->sparse);
+	cl_assert_equal_sz(2, git_index_entrycount(index));
+	git_index_free(index);
+
+	assert_sparse_status_index_is_preserved(index_path);
+
+	git_repository_free(repo);
+	cl_fixture_cleanup("sparse-status");
+}
+
+void test_status_worktree__sparse_index_workdir_only_reports_checked_out_modifications(void)
+{
+	git_repository *repo;
+	git_status_options opts = GIT_STATUS_OPTIONS_INIT;
+	git_status_list *statuslist;
+	const git_status_entry *status;
+	const char *index_path;
+
+	write_sparse_status_fixture(&repo, &index_path);
+	cl_git_rewritefile("sparse-status/checked-out.txt", "dirty\n");
+
+	opts.show = GIT_STATUS_SHOW_WORKDIR_ONLY;
+
+	cl_git_pass(git_status_list_new(&statuslist, repo, &opts));
+	cl_assert_equal_sz(1, git_status_list_entrycount(statuslist));
+	status = git_status_byindex(statuslist, 0);
+	cl_assert_equal_i(GIT_STATUS_WT_MODIFIED, status->status);
+	cl_assert_equal_s("checked-out.txt", status->index_to_workdir->old_file.path);
+	git_status_list_free(statuslist);
+
+	assert_sparse_status_index_is_preserved(index_path);
+
+	git_repository_free(repo);
+	cl_fixture_cleanup("sparse-status");
+}
+
+void test_status_worktree__sparse_index_workdir_only_reports_checked_out_deletions(void)
+{
+	git_repository *repo;
+	git_status_options opts = GIT_STATUS_OPTIONS_INIT;
+	git_status_list *statuslist;
+	const git_status_entry *status;
+	const char *index_path;
+
+	write_sparse_status_fixture(&repo, &index_path);
+	cl_git_pass(p_unlink("sparse-status/checked-out.txt"));
+
+	opts.show = GIT_STATUS_SHOW_WORKDIR_ONLY;
+
+	cl_git_pass(git_status_list_new(&statuslist, repo, &opts));
+	cl_assert_equal_sz(1, git_status_list_entrycount(statuslist));
+	status = git_status_byindex(statuslist, 0);
+	cl_assert_equal_i(GIT_STATUS_WT_DELETED, status->status);
+	cl_assert_equal_s("checked-out.txt", status->index_to_workdir->old_file.path);
+	git_status_list_free(statuslist);
+
+	assert_sparse_status_index_is_preserved(index_path);
+
+	git_repository_free(repo);
+	cl_fixture_cleanup("sparse-status");
+}
+
+void test_status_worktree__sparse_index_diff_reports_checked_out_modifications(void)
+{
+	git_repository *repo;
+	git_diff *diff;
+	const git_diff_delta *delta;
+	const char *index_path;
+
+	write_sparse_status_fixture(&repo, &index_path);
+	cl_git_rewritefile("sparse-status/checked-out.txt", "dirty\n");
+
+	cl_git_pass(git_diff_index_to_workdir(&diff, repo, NULL, NULL));
+	cl_assert_equal_sz(1, git_diff_num_deltas(diff));
+
+	delta = git_diff_get_delta(diff, 0);
+	cl_assert(delta != NULL);
+	cl_assert_equal_i(GIT_DELTA_MODIFIED, delta->status);
+	cl_assert_equal_s("checked-out.txt", delta->old_file.path);
+	git_diff_free(diff);
+
+	assert_sparse_status_index_is_preserved(index_path);
+
+	git_repository_free(repo);
+	cl_fixture_cleanup("sparse-status");
 }

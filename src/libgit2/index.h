@@ -46,7 +46,7 @@ struct git_index {
 	unsigned int distrust_filemode:1;
 	unsigned int no_symlinks:1;
 	unsigned int dirty:1;	/* whether we have unsaved changes */
-	unsigned int sparse:1;	/* whether the on-disk index has sparse directories */
+	unsigned int sparse:1;	/* whether the index has sparse directories */
 
 	git_tree_cache *tree;
 	git_pool tree_pool;
@@ -138,7 +138,14 @@ extern void git_index__set_ignore_case(git_index *index, bool ignore_case);
 
 extern unsigned int git_index__create_mode(unsigned int mode);
 
+extern bool git_index_entry__is_sparse_directory(const git_index_entry *entry);
 extern int git_index__expand_sparse(git_index *index, git_repository *repo);
+extern int git_index__open_sparsely(
+	git_index **index_out,
+	const char *index_path,
+	const git_index_options *opts);
+extern int git_index__read_sparsely(git_index *index, int force);
+extern int git_index__read_safely_sparsely(git_index *index);
 
 GIT_INLINE(const git_futils_filestamp *) git_index__filestamp(git_index *index)
 {

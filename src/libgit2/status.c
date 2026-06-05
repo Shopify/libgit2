@@ -278,11 +278,21 @@ int git_status_list_new(
 	if (status_validate_options(opts) < 0)
 		return -1;
 
-	if ((error = git_repository__ensure_not_bare(repo, "status")) < 0 ||
-		(error = git_repository_index(&index, repo)) < 0)
+	if ((error = git_repository__ensure_not_bare(repo, "status")) < 0)
 		return error;
 
-	if (opts != NULL && opts->baseline != NULL) {
+	if (show == GIT_STATUS_SHOW_WORKDIR_ONLY &&
+		(flags & GIT_STATUS_OPT_UPDATE_INDEX) == 0)
+		error = git_repository_index__open_sparsely(&index, repo);
+	else
+		error = git_repository_index(&index, repo);
+
+	if (error < 0)
+		return error;
+
+	if (show == GIT_STATUS_SHOW_WORKDIR_ONLY) {
+		head = NULL;
+	} else if (opts != NULL && opts->baseline != NULL) {
 		head = opts->baseline;
 	} else {
 		/* if there is no HEAD, that's okay - we'll make an empty iterator */
@@ -295,7 +305,10 @@ int git_status_list_new(
 
 	/* refresh index from disk unless prevented */
 	if ((flags & GIT_STATUS_OPT_NO_REFRESH) == 0 &&
-		git_index_read_safely(index) < 0)
+		(show == GIT_STATUS_SHOW_WORKDIR_ONLY &&
+			(flags & GIT_STATUS_OPT_UPDATE_INDEX) == 0 ?
+			git_index__read_safely_sparsely(index) :
+			git_index_read_safely(index)) < 0)
 		git_error_clear();
 
 	status = git_status_list_alloc(index);
@@ -581,4 +594,3 @@ int git_status_list_get_perfdata(
 
 	return 0;
 }
-

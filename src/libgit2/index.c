@@ -127,7 +127,9 @@ bool git_index__enforce_unsaved_safety = false;
 static int read_extension(size_t *read_len, git_index *index, size_t checksum_size, const char *buffer, size_t buffer_size);
 static int read_header(struct index_header *dest, const void *buffer);
 
-static int parse_index(git_index *index, const char *buffer, size_t buffer_size);
+static int index_read(git_index *index, int force, bool expand_sparse);
+static int parse_index(
+	git_index *index, const char *buffer, size_t buffer_size, bool expand_sparse);
 static bool is_index_extended(git_index *index);
 static int write_index(unsigned char checksum[GIT_HASH_MAX_SIZE], size_t *checksum_size, git_index *index, git_filebuf *file);
 
@@ -387,10 +389,11 @@ void git_index__set_ignore_case(git_index *index, bool ignore_case)
 	git_vector_sort(&index->reuc);
 }
 
-int git_index_open_ext(
+static int index_open_ext(
 	git_index **index_out,
 	const char *index_path,
-	const git_index_options *opts)
+	const git_index_options *opts,
+	bool expand_sparse)
 {
 	git_index *index;
 	int error = -1;
@@ -432,7 +435,7 @@ int git_index_open_ext(
 	index->reuc_search = reuc_srch;
 	index->version = INDEX_VERSION_NUMBER_DEFAULT;
 
-	if (index_path != NULL && (error = git_index_read(index, true)) < 0)
+	if (index_path != NULL && (error = index_read(index, true, expand_sparse)) < 0)
 		goto fail;
 
 	*index_out = index;
@@ -444,6 +447,22 @@ fail:
 	git_pool_clear(&index->tree_pool);
 	git_index_free(index);
 	return error;
+}
+
+int git_index_open_ext(
+	git_index **index_out,
+	const char *index_path,
+	const git_index_options *opts)
+{
+	return index_open_ext(index_out, index_path, opts, true);
+}
+
+int git_index__open_sparsely(
+	git_index **index_out,
+	const char *index_path,
+	const git_index_options *opts)
+{
+	return index_open_ext(index_out, index_path, opts, false);
 }
 
 int git_index_open(git_index **index_out, const char *index_path)
@@ -648,7 +667,7 @@ static int compare_checksum(git_index *index)
 	return !!memcmp(checksum, index->checksum, checksum_size);
 }
 
-int git_index_read(git_index *index, int force)
+static int index_read(git_index *index, int force, bool expand_sparse)
 {
 	int error = 0, updated;
 	git_str buffer = GIT_STR_INIT;
@@ -690,7 +709,7 @@ int git_index_read(git_index *index, int force)
 	error = git_index_clear(index);
 
 	if (!error)
-		error = parse_index(index, buffer.ptr, buffer.size);
+		error = parse_index(index, buffer.ptr, buffer.size, expand_sparse);
 
 	if (!error) {
 		git_futils_filestamp_set(&index->stamp, &stamp);
@@ -699,6 +718,16 @@ int git_index_read(git_index *index, int force)
 
 	git_str_dispose(&buffer);
 	return error;
+}
+
+int git_index_read(git_index *index, int force)
+{
+	return index_read(index, force, true);
+}
+
+int git_index__read_sparsely(git_index *index, int force)
+{
+	return index_read(index, force, false);
 }
 
 int git_index_read_safely(git_index *index)
@@ -710,6 +739,17 @@ int git_index_read_safely(git_index *index)
 	}
 
 	return git_index_read(index, false);
+}
+
+int git_index__read_safely_sparsely(git_index *index)
+{
+	if (git_index__enforce_unsaved_safety && index->dirty) {
+		git_error_set(GIT_ERROR_INDEX,
+			"the index has unsaved changes that would be overwritten by this operation");
+		return GIT_EINDEXDIRTY;
+	}
+
+	return git_index__read_sparsely(index, false);
 }
 
 static bool is_racy_entry(git_index *index, const git_index_entry *entry)
@@ -2727,7 +2767,8 @@ static int read_extension(size_t *read_len, git_index *index, size_t checksum_si
 	return 0;
 }
 
-static int parse_index(git_index *index, const char *buffer, size_t buffer_size)
+static int parse_index(
+	git_index *index, const char *buffer, size_t buffer_size, bool expand_sparse)
 {
 	int error = 0;
 	unsigned int i;
@@ -2835,7 +2876,7 @@ static int parse_index(git_index *index, const char *buffer, size_t buffer_size)
 
 	memcpy(index->checksum, checksum, checksum_size);
 
-	if (index->sparse && INDEX_OWNER(index) &&
+	if (expand_sparse && index->sparse && INDEX_OWNER(index) &&
 		(error = git_index__expand_sparse(index, INDEX_OWNER(index))) < 0)
 		goto done;
 
@@ -3307,7 +3348,7 @@ int git_index_entry_is_conflict(const git_index_entry *entry)
 	return (GIT_INDEX_ENTRY_STAGE(entry) > 0);
 }
 
-static bool index_entry_is_sparse_directory(const git_index_entry *entry)
+bool git_index_entry__is_sparse_directory(const git_index_entry *entry)
 {
 	size_t path_len = strlen(entry->path);
 
@@ -3447,7 +3488,7 @@ int git_index__expand_sparse(git_index *index, git_repository *repo)
 		goto done;
 
 	git_vector_foreach(&index->entries, i, entry) {
-		if (index_entry_is_sparse_directory(entry)) {
+		if (git_index_entry__is_sparse_directory(entry)) {
 			if ((error = expand_sparse_entry(index, &entries, repo, entry)) < 0)
 				goto done;
 		} else {

@@ -1210,6 +1210,10 @@ static int handle_unmatched_old_item(
 	git_delta_t delta_type = GIT_DELTA_DELETED;
 	int error;
 
+	if (git_index_entry__is_sparse_directory(info->oitem) &&
+		info->new_iter->type == GIT_ITERATOR_WORKDIR)
+		return iterator_advance(&info->oitem, info->old_iter);
+
 	/* update delta_type if this item is conflicted */
 	if (git_index_entry_is_conflict(info->oitem))
 		delta_type = GIT_DELTA_CONFLICTED;
@@ -1408,12 +1412,19 @@ out:
 	return error;
 }
 
-static int diff_load_index(git_index **index, git_repository *repo)
+static int diff_load_index(git_index **index, git_repository *repo, bool preserve_sparse)
 {
-	int error = git_repository_index__weakptr(index, repo);
+	int error;
+
+	if (preserve_sparse)
+		error = git_repository_index__open_sparsely(index, repo);
+	else
+		error = git_repository_index__weakptr(index, repo);
 
 	/* reload the repository index when user did not pass one in */
-	if (!error && git_index_read(*index, false) < 0)
+	if (!error && preserve_sparse && git_index__read_sparsely(*index, false) < 0)
+		git_error_clear();
+	else if (!error && !preserve_sparse && git_index_read(*index, false) < 0)
 		git_error_clear();
 
 	return error;
@@ -1441,7 +1452,7 @@ int git_diff_tree_to_index(
 
 	*out = NULL;
 
-	if (!index && (error = diff_load_index(&index, repo)) < 0)
+	if (!index && (error = diff_load_index(&index, repo, false)) < 0)
 		return error;
 
 	index_ignore_case = index->ignore_case;
@@ -1478,6 +1489,7 @@ int git_diff_index_to_workdir(
 	git_iterator *a = NULL, *b = NULL;
 	git_diff *diff = NULL;
 	char *prefix = NULL;
+	bool free_index = false;
 	int error = 0;
 
 	GIT_ASSERT_ARG(out);
@@ -1485,8 +1497,14 @@ int git_diff_index_to_workdir(
 
 	*out = NULL;
 
-	if (!index && (error = diff_load_index(&index, repo)) < 0)
-		return error;
+	if (!index) {
+		bool preserve_sparse = !(opts && (opts->flags & GIT_DIFF_UPDATE_INDEX));
+
+		if ((error = diff_load_index(&index, repo, preserve_sparse)) < 0)
+			return error;
+
+		free_index = preserve_sparse;
+	}
 
 	if ((error = diff_prepare_iterator_opts(&prefix, &a_opts, GIT_ITERATOR_INCLUDE_CONFLICTS,
 						&b_opts, GIT_ITERATOR_DONT_AUTOEXPAND, opts)) < 0 ||
@@ -1505,6 +1523,8 @@ out:
 	git_iterator_free(a);
 	git_iterator_free(b);
 	git_diff_free(diff);
+	if (free_index)
+		git_index_free(index);
 	git__free(prefix);
 
 	return error;
@@ -1563,7 +1583,7 @@ int git_diff_tree_to_workdir_with_index(
 
 	*out = NULL;
 
-	if ((error = diff_load_index(&index, repo)) < 0)
+	if ((error = diff_load_index(&index, repo, false)) < 0)
 		return error;
 
 	if (!(error = git_diff_tree_to_index(&d1, repo, tree, index, opts)) &&
@@ -1752,4 +1772,3 @@ on_error:
 
 	return error;
 }
-

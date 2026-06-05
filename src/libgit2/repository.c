@@ -1726,6 +1726,39 @@ int git_repository_index__weakptr(git_index **out, git_repository *repo)
 	return error;
 }
 
+int git_repository_index__open_sparsely(git_index **out, git_repository *repo)
+{
+	git_str index_path = GIT_STR_INIT;
+	git_index *index = NULL;
+	git_index_options index_opts = GIT_INDEX_OPTIONS_INIT;
+	int error;
+
+	GIT_ASSERT_ARG(out);
+	GIT_ASSERT_ARG(repo);
+
+	*out = NULL;
+
+	if ((error = repository_index_path(&index_path, repo)) < 0)
+		return error;
+
+	index_opts.oid_type = repo->oid_type;
+
+	if ((error = git_index__open_sparsely(&index, index_path.ptr, &index_opts)) == 0) {
+		GIT_REFCOUNT_OWN(index, repo);
+
+		if ((error = git_index_set_caps(index, GIT_INDEX_CAPABILITY_FROM_OWNER)) == 0) {
+			GIT_REFCOUNT_OWN(index, NULL);
+			*out = index;
+		} else {
+			GIT_REFCOUNT_OWN(index, NULL);
+			git_index_free(index);
+		}
+	}
+
+	git_str_dispose(&index_path);
+	return error;
+}
+
 int git_repository_index(git_index **out, git_repository *repo)
 {
 	if (git_repository_index__weakptr(out, repo) < 0)
