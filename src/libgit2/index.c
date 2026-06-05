@@ -44,6 +44,7 @@ static const unsigned int INDEX_HEADER_SIG = 0x44495243;
 static const char INDEX_EXT_TREECACHE_SIG[] = {'T', 'R', 'E', 'E'};
 static const char INDEX_EXT_UNMERGED_SIG[] = {'R', 'E', 'U', 'C'};
 static const char INDEX_EXT_CONFLICT_NAME_SIG[] = {'N', 'A', 'M', 'E'};
+static const char INDEX_EXT_SPARSE_DIRS_SIG[] = {'s', 'd', 'i', 'r'};
 
 #define INDEX_OWNER(idx) ((git_repository *)(GIT_REFCOUNT_OWNER(idx)))
 
@@ -539,6 +540,7 @@ int git_index_clear(git_index *index)
 	GIT_ASSERT_ARG(index);
 
 	index->dirty = 1;
+	index->sparse = 0;
 	index->tree = NULL;
 	git_pool_clear(&index->tree_pool);
 
@@ -824,6 +826,7 @@ const char *git_index_path(const git_index *index)
 int git_index_write_tree(git_oid *oid, git_index *index)
 {
 	git_repository *repo;
+	int error;
 
 	GIT_ASSERT_ARG(oid);
 	GIT_ASSERT_ARG(index);
@@ -834,6 +837,9 @@ int git_index_write_tree(git_oid *oid, git_index *index)
 		return create_index_error(-1, "Failed to write tree. "
 		  "the index file is not backed up by an existing repository");
 
+	if ((error = git_index__expand_sparse(index, repo)) < 0)
+		return error;
+
 	return git_tree__write_index(oid, index, repo);
 }
 
@@ -843,6 +849,9 @@ int git_index_write_tree_to(
 	GIT_ASSERT_ARG(oid);
 	GIT_ASSERT_ARG(index);
 	GIT_ASSERT_ARG(repo);
+
+	if (git_index__expand_sparse(index, repo) < 0)
+		return -1;
 
 	return git_tree__write_index(oid, index, repo);
 }
@@ -2704,6 +2713,8 @@ static int read_extension(size_t *read_len, git_index *index, size_t checksum_si
 		}
 		/* else, unsupported extension. We cannot parse this, but we can skip
 		 * it by returning `total_size */
+	} else if (memcmp(dest.signature, INDEX_EXT_SPARSE_DIRS_SIG, 4) == 0) {
+		index->sparse = 1;
 	} else {
 		/* we cannot handle non-ignorable extensions;
 		 * in fact they aren't even defined in the standard */
@@ -2823,6 +2834,10 @@ static int parse_index(git_index *index, const char *buffer, size_t buffer_size)
 	}
 
 	memcpy(index->checksum, checksum, checksum_size);
+
+	if (index->sparse && INDEX_OWNER(index) &&
+		(error = git_index__expand_sparse(index, INDEX_OWNER(index))) < 0)
+		goto done;
 
 #undef seek_forward
 
@@ -3063,7 +3078,12 @@ static int write_extension(git_filebuf *file, struct index_extension *header, gi
 	memcpy(&ondisk, header, 4);
 	ondisk.extension_size = htonl(header->extension_size);
 
-	git_filebuf_write(file, &ondisk, sizeof(struct index_extension));
+	if (git_filebuf_write(file, &ondisk, sizeof(struct index_extension)) < 0)
+		return -1;
+
+	if (!data->size)
+		return 0;
+
 	return git_filebuf_write(file, data->ptr, data->size);
 }
 
@@ -3171,6 +3191,17 @@ done:
 	return error;
 }
 
+static int write_sparse_extension(git_filebuf *file)
+{
+	git_str empty = GIT_STR_INIT;
+	struct index_extension extension;
+
+	memset(&extension, 0x0, sizeof(struct index_extension));
+	memcpy(&extension.signature, INDEX_EXT_SPARSE_DIRS_SIG, 4);
+
+	return write_extension(file, &extension, &empty);
+}
+
 static int write_tree_extension(git_index *index, git_filebuf *file)
 {
 	struct index_extension extension;
@@ -3249,6 +3280,10 @@ static int write_index(
 	if (index->reuc.length > 0 && write_reuc_extension(index, file) < 0)
 		return -1;
 
+	/* write the sparse directory extension */
+	if (index->sparse && write_sparse_extension(file) < 0)
+		return -1;
+
 	/* get out the hash for all the contents we've appended to the file */
 	git_filebuf_hash(checksum, file);
 
@@ -3270,6 +3305,205 @@ int git_index_entry_stage(const git_index_entry *entry)
 int git_index_entry_is_conflict(const git_index_entry *entry)
 {
 	return (GIT_INDEX_ENTRY_STAGE(entry) > 0);
+}
+
+static bool index_entry_is_sparse_directory(const git_index_entry *entry)
+{
+	size_t path_len = strlen(entry->path);
+
+	return (entry->mode == GIT_FILEMODE_TREE &&
+		GIT_INDEX_ENTRY_STAGE(entry) == GIT_INDEX_STAGE_NORMAL &&
+		(entry->flags_extended & GIT_INDEX_ENTRY_SKIP_WORKTREE) &&
+		path_len > 0 &&
+		entry->path[path_len - 1] == '/');
+}
+
+static void index_entries_free(git_vector *entries)
+{
+	git_index_entry *entry;
+	size_t i;
+
+	git_vector_foreach(entries, i, entry)
+		index_entry_free(entry);
+
+	git_vector_dispose(entries);
+}
+
+static void index_entries_defer_or_free(git_index *index, git_vector *entries)
+{
+	git_index_entry *entry;
+	size_t i;
+
+	if (git_atomic32_get(&index->readers) > 0) {
+		git_vector_foreach(entries, i, entry)
+			git_vector_insert(&index->deleted, entry);
+	} else {
+		git_vector_foreach(entries, i, entry)
+			index_entry_free(entry);
+	}
+
+	git_vector_dispose(entries);
+}
+
+typedef struct expand_sparse_data {
+	git_index *index;
+	git_vector *entries;
+	const char *base;
+	size_t base_len;
+} expand_sparse_data;
+
+static int expand_sparse_tree_cb(
+	const char *root, const git_tree_entry *tentry, void *payload)
+{
+	expand_sparse_data *data = payload;
+	git_index_entry *entry = NULL;
+	git_str path = GIT_STR_INIT;
+	size_t path_len;
+	int error = 0;
+
+	if (git_tree_entry__is_tree(tentry))
+		return 0;
+
+	if ((error = git_str_put(&path, data->base, data->base_len)) < 0 ||
+		(error = git_str_puts(&path, root)) < 0 ||
+		(error = git_str_puts(&path, tentry->filename)) < 0)
+		goto done;
+
+	path_len = path.size;
+
+	if ((error = index_entry_create(&entry, INDEX_OWNER(data->index), path.ptr, NULL, false)) < 0)
+		goto done;
+
+	entry->mode = tentry->attr;
+	git_oid_cpy(&entry->id, git_tree_entry_id(tentry));
+	entry->flags = GIT_INDEX_ENTRY_EXTENDED;
+	entry->flags_extended = GIT_INDEX_ENTRY_SKIP_WORKTREE;
+	index_entry_adjust_namemask(entry, path_len);
+
+	if ((error = git_vector_insert(data->entries, entry)) < 0) {
+		index_entry_free(entry);
+		goto done;
+	}
+
+done:
+	git_str_dispose(&path);
+	return error;
+}
+
+static int expand_sparse_entry(
+	git_index *index,
+	git_vector *entries,
+	git_repository *repo,
+	const git_index_entry *sparse_entry)
+{
+	expand_sparse_data data;
+	git_tree *tree = NULL;
+	git_str base = GIT_STR_INIT;
+	int error;
+
+	if ((error = git_tree_lookup(&tree, repo, &sparse_entry->id)) < 0)
+		return error;
+
+	if ((error = git_str_sets(&base, sparse_entry->path)) < 0)
+		goto done;
+
+	if (base.size == 0 || base.ptr[base.size - 1] != '/') {
+		if ((error = git_str_putc(&base, '/')) < 0)
+			goto done;
+	}
+
+	data.index = index;
+	data.entries = entries;
+	data.base = base.ptr;
+	data.base_len = base.size;
+
+	error = git_tree_walk(tree, GIT_TREEWALK_POST, expand_sparse_tree_cb, &data);
+
+done:
+	git_str_dispose(&base);
+	git_tree_free(tree);
+	return error;
+}
+
+int git_index__expand_sparse(git_index *index, git_repository *repo)
+{
+	git_vector entries = GIT_VECTOR_INIT;
+	git_index_entrymap entries_map = GIT_INDEX_ENTRYMAP_INIT;
+	git_index_entry *entry;
+	size_t i;
+	bool was_dirty;
+	int error = 0;
+
+	GIT_ASSERT_ARG(index);
+
+	if (!index->sparse)
+		return 0;
+
+	GIT_ASSERT_ARG(repo);
+
+	was_dirty = index->dirty;
+
+	if ((error = git_vector_init(&entries, index->entries.length, index->entries._cmp)) < 0)
+		goto done;
+
+	git_vector_foreach(&index->entries, i, entry) {
+		if (index_entry_is_sparse_directory(entry)) {
+			if ((error = expand_sparse_entry(index, &entries, repo, entry)) < 0)
+				goto done;
+		} else {
+			git_index_entry *dup = NULL;
+
+			if ((error = index_entry_dup(&dup, index, entry)) < 0 ||
+				(error = git_vector_insert(&entries, dup)) < 0) {
+				index_entry_free(dup);
+				goto done;
+			}
+		}
+	}
+
+	git_vector_sort(&entries);
+
+	entries_map.ignore_case = index->entries_map.ignore_case;
+
+	if ((error = git_index_entrymap_resize(&entries_map, entries.length)) < 0)
+		goto done;
+
+	if (git_atomic32_get(&index->readers) > 0) {
+		size_t deleted_size;
+
+		if (GIT_ADD_SIZET_OVERFLOW(&deleted_size,
+			index->deleted.length, index->entries.length)) {
+			git_error_set_oom();
+			error = -1;
+			goto done;
+		}
+
+		if ((error = git_vector_size_hint(&index->deleted, deleted_size)) < 0)
+			goto done;
+	}
+
+	git_vector_foreach(&entries, i, entry) {
+		if ((error = git_index_entrymap_put(&entries_map, entry)) < 0)
+			goto done;
+	}
+
+	git_vector_swap(&entries, &index->entries);
+	git_index_entrymap_swap(&entries_map, &index->entries_map);
+
+	index_entries_defer_or_free(index, &entries);
+	git_index_entrymap_dispose(&entries_map);
+
+	index->sparse = 0;
+	index->tree = NULL;
+	git_pool_clear(&index->tree_pool);
+	index->dirty = was_dirty;
+
+	return 0;
+
+done:
+	index_entries_free(&entries);
+	git_index_entrymap_dispose(&entries_map);
+	return error;
 }
 
 typedef struct read_tree_data {

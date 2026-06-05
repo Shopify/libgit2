@@ -1,4 +1,5 @@
 #include "clar_libgit2.h"
+#include "hash.h"
 #include "index.h"
 
 static const size_t index_entry_count = 109;
@@ -64,6 +65,95 @@ static void files_are_equal(const char *a, const char *b)
 	git_str_dispose(&buf_b);
 
 	cl_assert(pass);
+}
+
+static void write_u32(git_str *out, uint32_t value)
+{
+	uint32_t ondisk = htonl(value);
+	cl_git_pass(git_str_put(out, (char *)&ondisk, sizeof(ondisk)));
+}
+
+static void write_u16(git_str *out, uint16_t value)
+{
+	uint16_t ondisk = htons(value);
+	cl_git_pass(git_str_put(out, (char *)&ondisk, sizeof(ondisk)));
+}
+
+static void write_sparse_index_entry(
+	git_str *out,
+	const char *path,
+	const git_oid *id,
+	uint32_t mode,
+	uint16_t flags_extended)
+{
+	size_t path_len = strlen(path), entry_size, padding;
+
+	write_u32(out, 0); /* ctime seconds */
+	write_u32(out, 0); /* ctime nanoseconds */
+	write_u32(out, 0); /* mtime seconds */
+	write_u32(out, 0); /* mtime nanoseconds */
+	write_u32(out, 0); /* dev */
+	write_u32(out, 0); /* ino */
+	write_u32(out, mode);
+	write_u32(out, 0); /* uid */
+	write_u32(out, 0); /* gid */
+	write_u32(out, 0); /* file size */
+	cl_git_pass(git_str_put(out, (char *)&id->id, GIT_OID_SHA1_SIZE));
+	write_u16(out, GIT_INDEX_ENTRY_EXTENDED | (uint16_t)min(path_len, (size_t)GIT_INDEX_ENTRY_NAMEMASK));
+	write_u16(out, flags_extended);
+	cl_git_pass(git_str_put(out, path, path_len + 1));
+
+	entry_size = 40 + GIT_OID_SHA1_SIZE + 4 + path_len + 1;
+	padding = (8 - (entry_size % 8)) % 8;
+	cl_git_pass(git_str_put(out, "\0\0\0\0\0\0\0\0", padding));
+}
+
+static void write_sparse_index(const char *index_path, const git_oid *tree_id)
+{
+	git_str out = GIT_STR_INIT;
+	unsigned char checksum[GIT_HASH_SHA1_SIZE];
+
+	write_u32(&out, 0x44495243); /* DIRC */
+	write_u32(&out, 3);
+	write_u32(&out, 1);
+	write_sparse_index_entry(&out, "sparse/", tree_id, GIT_FILEMODE_TREE, GIT_INDEX_ENTRY_SKIP_WORKTREE);
+	cl_git_pass(git_str_put(&out, "sdir", 4));
+	write_u32(&out, 0);
+	cl_git_pass(git_hash_buf(checksum, out.ptr, out.size, GIT_HASH_ALGORITHM_SHA1));
+	cl_git_pass(git_str_put(&out, (char *)checksum, sizeof(checksum)));
+
+	cl_git_pass(git_futils_writebuffer(&out, index_path, O_RDWR | O_CREAT | O_TRUNC, GIT_INDEX_FILE_MODE));
+	git_str_dispose(&out);
+}
+
+static void write_sparse_index_fixture(
+	git_repository **out_repo,
+	git_oid *root_tree_id,
+	const char **out_index_path)
+{
+	git_repository *repo;
+	git_oid alpha_id, beta_id, sparse_tree_id;
+	git_treebuilder *builder = NULL;
+
+	cl_git_pass(git_repository_init(&repo, "./sparse-index", 0));
+	cl_git_pass(git_blob_create_from_buffer(&alpha_id, repo, "alpha\n", 6));
+	cl_git_pass(git_blob_create_from_buffer(&beta_id, repo, "beta\n", 5));
+
+	cl_git_pass(git_treebuilder_new(&builder, repo, NULL));
+	cl_git_pass(git_treebuilder_insert(NULL, builder, "alpha.txt", &alpha_id, GIT_FILEMODE_BLOB));
+	cl_git_pass(git_treebuilder_insert(NULL, builder, "beta.sh", &beta_id, GIT_FILEMODE_BLOB_EXECUTABLE));
+	cl_git_pass(git_treebuilder_write(&sparse_tree_id, builder));
+	git_treebuilder_free(builder);
+
+	cl_git_pass(git_treebuilder_new(&builder, repo, NULL));
+	cl_git_pass(git_treebuilder_insert(NULL, builder, "sparse", &sparse_tree_id, GIT_FILEMODE_TREE));
+	cl_git_pass(git_treebuilder_write(root_tree_id, builder));
+	git_treebuilder_free(builder);
+
+	*out_index_path = "sparse-index/.git/index";
+	write_sparse_index(*out_index_path, &sparse_tree_id);
+
+	*out_repo = repo;
 }
 
 
@@ -418,6 +508,98 @@ void test_index_tests__dirty_fails_optionally(void)
 
 	git_index_free(index);
 	cl_git_sandbox_cleanup();
+}
+
+void test_index_tests__sparse_index_opens_standalone(void)
+{
+	git_repository *repo;
+	git_index *index;
+	git_index_iterator *iterator;
+	git_oid tree_id, written_tree_id;
+	const char *index_path;
+	const git_index_entry *entry, *iter_entry;
+	git_str rewritten = GIT_STR_INIT;
+
+	write_sparse_index_fixture(&repo, &tree_id, &index_path);
+
+	cl_git_pass(git_index_open(&index, index_path));
+	cl_assert_equal_sz(1, git_index_entrycount(index));
+	cl_assert(index->sparse);
+
+	entry = git_index_get_byindex(index, 0);
+	cl_assert_equal_s("sparse/", entry->path);
+	cl_assert_equal_i(GIT_FILEMODE_TREE, entry->mode);
+	cl_assert(entry->flags_extended & GIT_INDEX_ENTRY_SKIP_WORKTREE);
+
+	cl_git_pass(git_index_write(index));
+	cl_git_pass(git_futils_readbuffer(&rewritten, index_path));
+	cl_assert(git__memmem(rewritten.ptr, rewritten.size, "sdir", 4) != NULL);
+
+	cl_git_pass(git_index_iterator_new(&iterator, index));
+	cl_git_pass(git_index_write_tree_to(&written_tree_id, index, repo));
+	cl_assert_equal_oid(&tree_id, &written_tree_id);
+	cl_assert_equal_sz(2, git_index_entrycount(index));
+	cl_assert(!index->sparse);
+
+	cl_git_pass(git_index_iterator_next(&iter_entry, iterator));
+	cl_assert_equal_s("sparse/", iter_entry->path);
+	cl_assert_equal_i(GIT_ITEROVER, git_index_iterator_next(&iter_entry, iterator));
+	git_index_iterator_free(iterator);
+
+	git_str_dispose(&rewritten);
+	git_index_free(index);
+	git_repository_free(repo);
+	cl_fixture_cleanup("sparse-index");
+}
+
+void test_index_tests__sparse_index_expands_with_repository(void)
+{
+	git_repository *repo;
+	git_index *index;
+	git_oid tree_id, written_tree_id;
+	git_tree *tree = NULL;
+	const git_tree_entry *sparse_tree_entry;
+	const char *index_path;
+	const git_index_entry *entry;
+	git_str rewritten = GIT_STR_INIT;
+
+	write_sparse_index_fixture(&repo, &tree_id, &index_path);
+
+	cl_git_pass(git_repository_index(&index, repo));
+	cl_assert_equal_sz(2, git_index_entrycount(index));
+	cl_assert(!index->sparse);
+	cl_assert(!git_index_is_dirty(index));
+
+	cl_assert((entry = git_index_get_bypath(index, "sparse/alpha.txt", 0)) != NULL);
+	cl_assert_equal_i(GIT_FILEMODE_BLOB, entry->mode);
+	cl_assert(entry->flags_extended & GIT_INDEX_ENTRY_SKIP_WORKTREE);
+
+	cl_assert((entry = git_index_get_bypath(index, "sparse/beta.sh", 0)) != NULL);
+	cl_assert_equal_i(GIT_FILEMODE_BLOB_EXECUTABLE, entry->mode);
+	cl_assert(entry->flags_extended & GIT_INDEX_ENTRY_SKIP_WORKTREE);
+
+	cl_git_pass(git_index_write_tree(&written_tree_id, index));
+	cl_assert_equal_oid(&tree_id, &written_tree_id);
+
+	cl_git_pass(git_index_write(index));
+	cl_git_pass(git_futils_readbuffer(&rewritten, index_path));
+	cl_assert(git__memmem(rewritten.ptr, rewritten.size, "sdir", 4) == NULL);
+
+	git_str_dispose(&rewritten);
+
+	cl_git_pass(git_tree_lookup(&tree, repo, &tree_id));
+	cl_assert((sparse_tree_entry = git_tree_entry_byname(tree, "sparse")) != NULL);
+	write_sparse_index(index_path, git_tree_entry_id(sparse_tree_entry));
+	git_tree_free(tree);
+
+	cl_git_pass(git_index_read(index, true));
+	cl_assert_equal_sz(2, git_index_entrycount(index));
+	cl_assert(!index->sparse);
+	cl_assert(!git_index_is_dirty(index));
+
+	git_index_free(index);
+	git_repository_free(repo);
+	cl_fixture_cleanup("sparse-index");
 }
 
 void test_index_tests__add_frombuffer_reset_entry(void)

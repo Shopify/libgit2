@@ -1706,13 +1706,17 @@ int git_repository_index__weakptr(git_index **out, git_repository *repo)
 		if (!error) {
 			GIT_REFCOUNT_OWN(index, repo);
 
-			if (git_atomic_compare_and_swap(&repo->_index, NULL, index) != NULL) {
+			if ((error = git_index__expand_sparse(index, repo)) < 0) {
+				GIT_REFCOUNT_OWN(index, NULL);
+				git_index_free(index);
+			} else if (git_atomic_compare_and_swap(&repo->_index, NULL, index) != NULL) {
 				GIT_REFCOUNT_OWN(index, NULL);
 				git_index_free(index);
 			}
 
-			error = git_index_set_caps(repo->_index,
-			                           GIT_INDEX_CAPABILITY_FROM_OWNER);
+			if (!error)
+				error = git_index_set_caps(repo->_index,
+				                           GIT_INDEX_CAPABILITY_FROM_OWNER);
 		}
 
 		git_str_dispose(&index_path);
