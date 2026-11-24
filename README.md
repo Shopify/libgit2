@@ -1,3 +1,5 @@
+> **This repository is no longer maintained.** It has been archived and receives no updates or security fixes.
+
 libgit2 - the Git linkable library
 ==================================
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/9609/badge)](https://www.bestpractices.dev/projects/9609)
